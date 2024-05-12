@@ -25,3 +25,6 @@ build-and-load-image:
 
 run-debug-container:
     kubectl debug redis-master-0 --image=valkeyri:test --profile='sysadmin' -it
+
+dump-tcp:
+    sudo tcpdump -i lo port 6379
