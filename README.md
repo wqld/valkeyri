@@ -37,7 +37,9 @@ Statistics         Avg          Stdev          Max
   Throughput:     661.08/s
 ```
 
-#### with valkeyri
+#### with valkeyri (SKB mode)
+
+`just run-release`
 
 ```sh
 Statistics         Avg          Stdev          Max
@@ -53,3 +55,5 @@ Statistics         Avg          Stdev          Max
     others - 0
   Throughput:    1907.38/s
 ```
+
+Even without xdp native mode, you can confirm that there is more than a 3-fold performance improvement.
