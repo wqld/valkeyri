@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::mem;
+use core::{mem, ops::Deref};
 
 use aya_ebpf::{
     bindings::xdp_action::{XDP_ABORTED, XDP_PASS, XDP_TX},
@@ -11,7 +11,6 @@ use aya_ebpf::{
     programs::XdpContext,
 };
 use aya_log_ebpf::info;
-use common::{ConnTrack, SockPair, RESP_ESTABLISHED, RESP_INITIATED};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -32,82 +31,42 @@ pub fn valkeyri(ctx: XdpContext) -> u32 {
 }
 
 fn try_resp_cache(ctx: XdpContext) -> Result<u32, ()> {
-    let data_end = ctx.data_end();
-    let data = ctx.data();
+    let ctx = match Context::new(&ctx) {
+        Ok(ctx) => ctx,
+        Err(_) => return Ok(XDP_PASS),
+    };
 
-    let eth_hdr: *mut EthHdr = ptr_at_mut(&ctx, 0)?;
+    let sock_pair = SockPair::new(ctx.ip_hdr, ctx.tcp_hdr);
 
-    match unsafe { (*eth_hdr).ether_type } {
-        EtherType::Ipv4 => {}
-        _ => return Ok(XDP_PASS),
-    }
-
-    let ip_hdr: *mut Ipv4Hdr = ptr_at_mut(&ctx, EthHdr::LEN)?;
-
-    match unsafe { (*ip_hdr).proto } {
-        IpProto::Tcp => {}
-        _ => return Ok(XDP_PASS),
-    }
-
-    let tcp_hdr: *mut TcpHdr = ptr_at_mut(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-
-    let src_ip = unsafe { (*ip_hdr).src_addr };
-    let dst_ip = unsafe { (*ip_hdr).dst_addr };
-
-    let src_port = unsafe { (*tcp_hdr).source };
-    let dst_port = unsafe { (*tcp_hdr).dest };
-
-    if u16::from_be(dst_port) != 6379 {
+    if sock_pair.dst_port != 6379 {
         return Ok(XDP_PASS);
     }
 
-    let sock_pair = SockPair {
-        src_ip,
-        dst_ip,
-        src_port: src_port as u32,
-        dst_port: dst_port as u32,
-    };
-
-    let ip_hdr_len = unsafe { ((*ip_hdr).ihl() * 4) as usize };
-    let tcp_hdr_len = unsafe { ((*tcp_hdr).doff() * 4) as usize };
-
     unsafe {
-        if (*tcp_hdr).ack() == 1
-            && (*tcp_hdr).psh() == 0
-            && (*tcp_hdr).syn() == 0
-            && (*tcp_hdr).fin() == 0
-        {
+        if ctx.ack_only() {
             if let Some(conn_track) = CONNTRACK_MAP.get_ptr_mut(&sock_pair) {
                 match (*conn_track).state {
                     RESP_INITIATED => {
-                        info!(&ctx, "RESP Established");
+                        // info!(ctx.ctx, "RESP Established");
                         (*conn_track).state = RESP_ESTABLISHED;
                     }
                     _ => {
-                        info!(&ctx, "(ACK) Nothing to do");
+                        // info!(ctx.ctx, "(ACK) Nothing to do");
                     }
                 }
             }
         }
 
-        if (*tcp_hdr).psh() != 1 || (*tcp_hdr).ack() != 1 {
+        if !ctx.psh_ack() {
             return Ok(XDP_PASS);
         }
     }
 
-    let ip_total_len = unsafe { u16::from_be((*ip_hdr).tot_len) as usize };
-    let payload_offset = EthHdr::LEN + ip_hdr_len + tcp_hdr_len;
-    let payload_len = ip_total_len - ip_hdr_len - tcp_hdr_len;
-
-    if data + EthHdr::LEN + ip_hdr_len + tcp_hdr_len > data_end {
+    if ctx.payload_len < 11 {
         return Ok(XDP_PASS);
     }
 
-    if payload_len < 11 {
-        return Ok(XDP_PASS);
-    }
-
-    let method: [u8; 3] = unsafe { *ptr_at(&ctx, payload_offset + 8)? };
+    let method: [u8; 3] = unsafe { *ptr_at(&ctx, ctx.payload_offset + 8)? };
 
     match method {
         [b'G', b'E', b'T'] => {}
@@ -116,50 +75,16 @@ fn try_resp_cache(ctx: XdpContext) -> Result<u32, ()> {
                 if let Some(conn_track) = CONNTRACK_MAP.get_ptr_mut(&sock_pair) {
                     match (*conn_track).state {
                         RESP_ESTABLISHED => {
-                            info!(&ctx, "RESP already established");
-                            // (*conn_track).state = RESP_PING_RECV;
-
-                            // send PONG to client with the same payload (XDP_TX)
-                            const PAYLOAD_LEN: usize = 7;
+                            // info!(ctx.ctx, "RESP already established");
                             let http_response = &[0x2b, 0x50, 0x4f, 0x4e, 0x47, 0x0d, 0x0a];
-                            let payload: *mut [u8; PAYLOAD_LEN] = ptr_at_mut(&ctx, payload_offset)?;
-
-                            if data + payload_offset + PAYLOAD_LEN > data_end {
-                                return Ok(XDP_PASS);
-                            }
-
-                            (*payload).copy_from_slice(http_response);
-
-                            mem::swap(&mut (*eth_hdr).src_addr, &mut (*eth_hdr).dst_addr);
-                            mem::swap(&mut (*ip_hdr).src_addr, &mut (*ip_hdr).dst_addr);
-                            mem::swap(&mut (*tcp_hdr).source, &mut (*tcp_hdr).dest);
-
-                            (*ip_hdr).tot_len = u16::to_be(
-                                ip_hdr_len as u16 + tcp_hdr_len as u16 + PAYLOAD_LEN as u16,
-                            );
-                            (*ip_hdr).check = compute_ip_csum(&mut *ip_hdr, false);
-
-                            let seq = u32::from_be((*tcp_hdr).seq);
-                            let ack_seq = (*tcp_hdr).ack_seq;
-                            let new_ack_seq = u32::to_be(seq + payload_len as u32);
-
-                            (*tcp_hdr).seq = ack_seq;
-                            (*tcp_hdr).ack_seq = new_ack_seq;
-                            (*tcp_hdr).check = compute_tcp_csum(&ctx, false)?;
-
-                            bpf_xdp_adjust_tail(
-                                ctx.ctx,
-                                0 - (data_end - (data + payload_offset + PAYLOAD_LEN)) as i32,
-                            );
-
-                            return Ok(XDP_TX);
+                            return kernel_reply(&ctx, http_response);
                         }
                         state => {
-                            info!(&ctx, "(PING) Unexpected state: {}", state);
+                            // info!(ctx.ctx, "(PING) Unexpected state: {}", state);
                         }
                     }
                 } else {
-                    info!(&ctx, "RESP Initiated");
+                    // info!(ctx.ctx, "RESP Initiated");
                     let conn_track = ConnTrack {
                         state: RESP_INITIATED,
                     };
@@ -174,50 +99,155 @@ fn try_resp_cache(ctx: XdpContext) -> Result<u32, ()> {
         _ => return Ok(XDP_PASS),
     }
 
-    info!(
-        &ctx,
-        "Before {:i}:{} -> {:i}:{} ", src_ip, src_port, dst_ip, dst_port,
-    );
+    let http_response = &[0x24, 0x32, 0x0d, 0x0a, 0x34, 0x31, 0x0d, 0x0a];
+    unsafe { kernel_reply(&ctx, http_response) }
+}
 
-    unsafe {
-        const PAYLOAD_LEN: usize = 8;
-        let http_response = &[0x24, 0x32, 0x0d, 0x0a, 0x34, 0x31, 0x0d, 0x0a];
-        let payload: *mut [u8; PAYLOAD_LEN] = ptr_at_mut(&ctx, payload_offset)?;
+struct Context<'a> {
+    ctx: &'a XdpContext,
+    eth_hdr: *mut EthHdr,
+    ip_hdr: *mut Ipv4Hdr,
+    tcp_hdr: *mut TcpHdr,
+    ip_hdr_len: usize,
+    tcp_hdr_len: usize,
+    payload_len: usize,
+    payload_offset: usize,
+}
 
-        if data + payload_offset + PAYLOAD_LEN > data_end {
-            return Ok(XDP_PASS);
+impl Deref for Context<'_> {
+    type Target = XdpContext;
+
+    fn deref(&self) -> &Self::Target {
+        self.ctx
+    }
+}
+
+impl<'a> Context<'a> {
+    fn new(ctx: &'a XdpContext) -> Result<Self, ()> {
+        let data_end = ctx.data_end();
+        let data = ctx.data();
+
+        let eth_hdr: *mut EthHdr = ptr_at_mut(ctx, 0)?;
+
+        match unsafe { (*eth_hdr).ether_type } {
+            EtherType::Ipv4 => {}
+            _ => return Err(()),
         }
 
-        (*payload).copy_from_slice(http_response);
+        let ip_hdr: *mut Ipv4Hdr = ptr_at_mut(ctx, EthHdr::LEN)?;
 
-        mem::swap(&mut (*eth_hdr).src_addr, &mut (*eth_hdr).dst_addr);
-        mem::swap(&mut (*ip_hdr).src_addr, &mut (*ip_hdr).dst_addr);
-        mem::swap(&mut (*tcp_hdr).source, &mut (*tcp_hdr).dest);
+        match unsafe { (*ip_hdr).proto } {
+            IpProto::Tcp => {}
+            _ => return Err(()),
+        }
 
-        (*ip_hdr).tot_len = u16::to_be(ip_hdr_len as u16 + tcp_hdr_len as u16 + PAYLOAD_LEN as u16);
-        (*ip_hdr).check = compute_ip_csum(&mut *ip_hdr, false);
+        let tcp_hdr: *mut TcpHdr = ptr_at_mut(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
 
-        // update seq, ack_seq
-        let seq = u32::from_be((*tcp_hdr).seq);
-        let ack_seq = (*tcp_hdr).ack_seq;
-        let new_ack_seq = u32::to_be(seq + payload_len as u32);
+        let ip_hdr_len = unsafe { ((*ip_hdr).ihl() * 4) as usize };
+        let tcp_hdr_len = unsafe { ((*tcp_hdr).doff() * 4) as usize };
 
-        (*tcp_hdr).seq = ack_seq;
-        (*tcp_hdr).ack_seq = new_ack_seq;
-        (*tcp_hdr).check = compute_tcp_csum(&ctx, false)?;
+        let ip_total_len = unsafe { u16::from_be((*ip_hdr).tot_len) as usize };
+        let payload_offset = EthHdr::LEN + ip_hdr_len + tcp_hdr_len;
+        let payload_len = ip_total_len - ip_hdr_len - tcp_hdr_len;
 
-        bpf_xdp_adjust_tail(
-            ctx.ctx,
-            0 - (data_end - (data + payload_offset + PAYLOAD_LEN)) as i32,
-        );
+        if data + EthHdr::LEN + ip_hdr_len + tcp_hdr_len > data_end {
+            return Err(());
+        }
+
+        Ok(Self {
+            ctx,
+            eth_hdr,
+            ip_hdr,
+            tcp_hdr,
+            ip_hdr_len,
+            tcp_hdr_len,
+            payload_len,
+            payload_offset,
+        })
     }
 
-    Ok(XDP_TX)
+    fn ack_only(&self) -> bool {
+        unsafe {
+            (*self.tcp_hdr).ack() == 1
+                && (*self.tcp_hdr).syn() == 0
+                && (*self.tcp_hdr).psh() == 0
+                && (*self.tcp_hdr).fin() == 0
+        }
+    }
+
+    fn psh_ack(&self) -> bool {
+        unsafe { (*self.tcp_hdr).ack() == 1 && (*self.tcp_hdr).psh() == 1 }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SockPair {
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+}
+
+impl SockPair {
+    fn new(ip_hdr: *const Ipv4Hdr, tcp_hdr: *const TcpHdr) -> Self {
+        Self {
+            src_ip: unsafe { u32::from_be((*ip_hdr).src_addr) },
+            dst_ip: unsafe { u32::from_be((*ip_hdr).dst_addr) },
+            src_port: unsafe { u16::from_be((*tcp_hdr).source) },
+            dst_port: unsafe { u16::from_be((*tcp_hdr).dest) },
+        }
+    }
+}
+
+pub const RESP_INITIATED: u32 = 0;
+pub const RESP_ESTABLISHED: u32 = 1;
+// pub const RESP_PING_RECV: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ConnTrack {
+    pub state: u32,
 }
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     unsafe { core::hint::unreachable_unchecked() }
+}
+
+#[inline(always)]
+unsafe fn kernel_reply<const N: usize>(ctx: &Context, http_response: &[u8; N]) -> Result<u32, ()> {
+    let data_end = ctx.data_end();
+    let data = ctx.data();
+
+    if data + ctx.payload_offset + N > data_end {
+        return Ok(XDP_PASS);
+    }
+
+    mem::swap(&mut (*ctx.eth_hdr).src_addr, &mut (*ctx.eth_hdr).dst_addr);
+    mem::swap(&mut (*ctx.ip_hdr).src_addr, &mut (*ctx.ip_hdr).dst_addr);
+    mem::swap(&mut (*ctx.tcp_hdr).source, &mut (*ctx.tcp_hdr).dest);
+
+    (*ctx.ip_hdr).tot_len = u16::to_be(ctx.ip_hdr_len as u16 + ctx.tcp_hdr_len as u16 + N as u16);
+    (*ctx.ip_hdr).check = compute_ip_csum(&mut *ctx.ip_hdr, false);
+
+    let seq = u32::from_be((*ctx.tcp_hdr).seq);
+    let ack_seq = (*ctx.tcp_hdr).ack_seq;
+    let new_ack_seq = u32::to_be(seq + ctx.payload_len as u32);
+
+    (*ctx.tcp_hdr).seq = ack_seq;
+    (*ctx.tcp_hdr).ack_seq = new_ack_seq;
+    (*ctx.tcp_hdr).check = compute_tcp_csum(ctx, false)?;
+
+    let payload: *mut [u8; N] = ptr_at_mut(ctx, ctx.payload_offset)?;
+    (*payload)[..N].copy_from_slice(&http_response[..N]);
+
+    bpf_xdp_adjust_tail(
+        ctx.ctx.ctx,
+        0 - (data_end - (data + ctx.payload_offset + N)) as i32,
+    );
+
+    Ok(XDP_TX)
 }
 
 #[inline(always)]
@@ -247,7 +277,7 @@ fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
 }
 
 #[inline(always)]
-pub unsafe fn compute_ip_csum(ip_hdr: *mut Ipv4Hdr, verify: bool) -> u16 {
+unsafe fn compute_ip_csum(ip_hdr: *mut Ipv4Hdr, verify: bool) -> u16 {
     let mut checksum = 0u32;
     let mut next = ip_hdr as *mut u16;
 
@@ -264,7 +294,7 @@ pub unsafe fn compute_ip_csum(ip_hdr: *mut Ipv4Hdr, verify: bool) -> u16 {
 }
 
 #[inline(always)]
-pub unsafe fn compute_tcp_csum(ctx: &XdpContext, verify: bool) -> Result<u16, ()> {
+unsafe fn compute_tcp_csum(ctx: &XdpContext, verify: bool) -> Result<u16, ()> {
     let mut checksum = 0u32;
     let ip_hdr: *mut Ipv4Hdr = ptr_at_mut(ctx, EthHdr::LEN)?;
     let tcp_hdr: *mut TcpHdr = ptr_at_mut(ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;

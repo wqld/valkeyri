@@ -43,17 +43,17 @@ Statistics         Avg          Stdev          Max
 
 ```sh
 Statistics         Avg          Stdev          Max
-  Reqs/sec       1900.20        32.10        1946.00
-  Latency        26.21ms       10.04ms       75.25ms
+  Reqs/sec       9079.80        227.76       9318.00
+  Latency         5.50ms        1.78ms       23.15ms
   Latency Distribution
-     50%     18.27ms
-     75%     21.85ms
-     90%     24.11ms
-     99%     25.90ms
+     50%      4.21ms
+     75%      4.71ms
+     90%      5.08ms
+     99%      5.42ms
   HTTP codes:
-    1XX - 0, 2XX - 9547, 3XX - 0, 4XX - 0, 5XX - 0
+    1XX - 0, 2XX - 45408, 3XX - 0, 4XX - 0, 5XX - 0
     others - 0
-  Throughput:    1907.38/s
+  Throughput:    9093.90/s
 ```
 
-Even without xdp native mode, you can confirm that there is more than a 3-fold performance improvement.
+Even without XDP native mode, you can confirm that there is more than a 10x performance improvement.
